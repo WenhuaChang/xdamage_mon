@@ -6,19 +6,24 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/Xdamage.h>
+#include <X11/extensions/Xrender.h>
 
 typedef struct _win {
 	struct _win *next;
 	Window id;
 	Damage damage;
+	XWindowAttributes a;
 } WIN;
 
 
 static int damage_event, damage_error;
 static Display *dpy;
 static int scr;
+static int scr_width;
+static int scr_height;
 static Window root;
 static WIN *list;
+static XserverRegion allDamage;
 
 static void
 usage (const char *prgname)
@@ -62,15 +67,13 @@ free_list (void)
 static void
 add_list (Window id)
 {
-	XWindowAttributes a;
-
-	if (!XGetWindowAttributes (dpy, id, &a))
-		return;
-
-	if (a.class == InputOnly)
-		return;
-
 	WIN *new = malloc (sizeof (WIN));
+
+	if (!XGetWindowAttributes (dpy, id, &new->a))
+		goto fail;
+
+	if (new->a.class == InputOnly)
+		goto fail;
 
 	new->id = id;
 #ifdef DEBUG
@@ -91,6 +94,48 @@ add_list (Window id)
 
 		p->next = new;
 	}
+
+	return;
+
+fail:
+	free (new);
+	return;
+}
+
+static void
+draw_rect (Window win, XRectangle *r)
+{
+	Pixmap	 pixmap;
+	Picture	 picture;
+	XRenderColor color;
+	XRenderPictFormat *pictureFormat;
+	XGCValues gcv;
+	GC gc;
+
+    	gcv.graphics_exposures = False;
+	gc = XCreateGC (dpy, win, GCGraphicsExposures, &gcv);
+	pixmap  = XCreatePixmap (dpy, win, 640, 480, 24);
+	XFillRectangle (dpy, pixmap, gc, 0, 0, 640, 480);
+
+	pictureFormat = XRenderFindStandardFormat (dpy, PictStandardRGB24);
+	picture = XRenderCreatePicture (dpy, pixmap, pictureFormat, 0, NULL);
+
+	color.red   = 0x0000;
+	color.green = 0x0000;
+	color.blue  = 0xff00;
+
+	XRenderFillRectangle (dpy,
+			PictOpSrc,
+			picture,
+			&color,
+			r->x, r->y,
+			r->width,
+			r->height);
+
+	XCopyArea (dpy, pixmap, win, gc, 0, 0, 640, 480, 0, 0);
+	XRenderFreePicture (dpy, picture);
+	XFreePixmap (dpy, pixmap);
+	XFreeGC (dpy, gc);
 }
 
 int
@@ -98,6 +143,7 @@ main (int argc, char **argv)
 {
 	char *display = NULL;
 	Window watchWindow = None;
+	Window wsta = None;
 	Window root_return, parent_return;
 	Window *children = NULL;
 	XEvent ev;
@@ -124,6 +170,8 @@ main (int argc, char **argv)
 	}
 
 	scr = DefaultScreen (dpy);
+	scr_width = XDisplayWidth (dpy, scr);
+	scr_height = XDisplayHeight (dpy, scr);
     	root = RootWindow (dpy, scr);
 
 	if (!XDamageQueryExtension (dpy, &damage_event, &damage_error)) {
@@ -142,34 +190,53 @@ main (int argc, char **argv)
 		add_list (watchWindow);
 	}
 	
+	wsta = XCreateSimpleWindow (dpy, root, 0, 0, 640, 480, 0, 0, 0x0);
+    	XMapWindow (dpy, wsta);
 
 	for (;;) {
+	
+		while (XPending (dpy)) {
 
-		XNextEvent (dpy, &ev);
+			XNextEvent (dpy, &ev);
+			if (ev.type == damage_event + XDamageNotify) {
+				XDamageNotifyEvent *de = (XDamageNotifyEvent *) &ev;
+				XserverRegion parts;
+				WIN *win;
 
-		if (ev.type == damage_event + XDamageNotify) {
-			XDamageNotifyEvent *de = (XDamageNotifyEvent *) &ev;
-			XRectangle *rectlist;
-			XserverRegion parts;
-			WIN *win;
-			int howmany, i;
-
-			win = find_win (list, de->drawable);
-
-			parts = XFixesCreateRegion (dpy, NULL, 0);
-			XDamageSubtract (dpy, win->damage, None, parts);
-			rectlist = XFixesFetchRegion (dpy, parts, &howmany);
-
-			for (i = 0; i < howmany; ++i) {
-
-				XRectangle *r = rectlist + i;
-				fprintf (stderr, "<0x%x>[%d] %d %d %d %d\n",
-					(unsigned int)win->id, i, r->x, r->y, r->width, r->height);
+				win = find_win (list, de->drawable);
+				parts = XFixesCreateRegion (dpy, NULL, 0);
+				XDamageSubtract (dpy, win->damage, None, parts);
+				XFixesTranslateRegion (dpy, parts, win->a.x + win->a.border_width, win->a.y + win->a.border_width);
+				if (allDamage) {
+					XFixesUnionRegion (dpy, allDamage, allDamage, parts);
+					XFixesDestroyRegion (dpy, parts);
+				}
+				else
+					allDamage = parts;
 			}
 		}
+
+		if (allDamage) {
+			XRectangle *rectlist;
+			int howmany, i;
+			
+			rectlist = XFixesFetchRegion (dpy, allDamage, &howmany);
+			for (i = 0; i < howmany; ++i) {
+				XRectangle *r = rectlist + i;
+				fprintf (stderr, "[%d] %d %d %d %d\n", i, r->x, r->y, r->width, r->height);
+				if (wsta) {
+					draw_rect (wsta, r);
+				}
+			}
+			
+			XFixesDestroyRegion (dpy, allDamage);
+			allDamage = None;
+		}
+
 	}
 
 	free_list();
+	XDestroyWindow (dpy, wsta);
 	XCloseDisplay (dpy);
 	return 0;
 }
